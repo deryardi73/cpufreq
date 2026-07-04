@@ -133,16 +133,22 @@ static unsigned int up_threshold_any_cpu_freq = 1497600;
 
 static int two_phase_freq_array[NR_CPUS] = {[0 ... NR_CPUS-1] = 1728000} ;
 
-static int cpufreq_governor_intelliactive(struct cpufreq_policy *policy,
-		unsigned int event);
+static int intelliactive_gov_init(struct cpufreq_policy *policy);
+static void intelliactive_gov_exit(struct cpufreq_policy *policy);
+static int intelliactive_gov_start(struct cpufreq_policy *policy);
+static void intelliactive_gov_stop(struct cpufreq_policy *policy);
+static void intelliactive_gov_limits(struct cpufreq_policy *policy);
 
 #ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_INTELLIACTIVE
 static
 #endif
 struct cpufreq_governor cpufreq_gov_intelliactive = {
 	.name = "intelliactive",
-	.governor = cpufreq_governor_intelliactive,
-	.max_transition_latency = 10000000,
+	.init = intelliactive_gov_init,
+	.exit = intelliactive_gov_exit,
+	.start = intelliactive_gov_start,
+	.stop = intelliactive_gov_stop,
+	.limits = intelliactive_gov_limits,
 	.owner = THIS_MODULE,
 };
 
@@ -1292,133 +1298,151 @@ static struct notifier_block cpufreq_interactive_idle_nb = {
 	.notifier_call = cpufreq_interactive_idle_notifier,
 };
 
-static int cpufreq_governor_intelliactive(struct cpufreq_policy *policy,
-		unsigned int event)
+static int intelliactive_gov_init(struct cpufreq_policy *policy)
+{
+	return 0;
+}
+
+static void intelliactive_gov_exit(struct cpufreq_policy *policy)
+{
+}
+
+static int intelliactive_gov_start(struct cpufreq_policy *policy)
 {
 	int rc;
 	unsigned int j;
 	struct cpufreq_interactive_cpuinfo *pcpu;
 	struct cpufreq_frequency_table *freq_table;
 
-	switch (event) {
-	case CPUFREQ_GOV_START:
-		mutex_lock(&gov_lock);
+	mutex_lock(&gov_lock);
 
-		freq_table =
-			cpufreq_frequency_get_table(policy->cpu);
-		if (!hispeed_freq)
-			hispeed_freq = policy->max;
+	freq_table =
+		cpufreq_frequency_get_table(policy->cpu);
+	if (!hispeed_freq)
+		hispeed_freq = policy->max;
 
-		for_each_cpu(j, policy->cpus) {
-			pcpu = &per_cpu(cpuinfo, j);
-			pcpu->policy = policy;
-			pcpu->target_freq = policy->cur;
-			pcpu->freq_table = freq_table;
-			pcpu->floor_freq = pcpu->target_freq;
-			pcpu->floor_validate_time =
-				ktime_to_us(ktime_get());
-			pcpu->hispeed_validate_time =
-				pcpu->floor_validate_time;
-			down_write(&pcpu->enable_sem);
-			del_timer_sync(&pcpu->cpu_timer);
-			del_timer_sync(&pcpu->cpu_slack_timer);
-			cpufreq_interactive_timer_start(j);
-			pcpu->governor_enabled = 1;
-			up_write(&pcpu->enable_sem);
-		}
-
-		/*
-		 * Do not register the idle hook and create sysfs
-		 * entries if we have already done so.
-		 */
-		if (++active_count > 1) {
-			mutex_unlock(&gov_lock);
-			return 0;
-		}
-
-		rc = sysfs_create_group(cpufreq_global_kobject,
-				&interactive_attr_group);
-		if (rc) {
-			mutex_unlock(&gov_lock);
-			return rc;
-		}
-
-		idle_notifier_register(&cpufreq_interactive_idle_nb);
-		cpufreq_register_notifier(
-			&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
-		mutex_unlock(&gov_lock);
-		break;
-
-	case CPUFREQ_GOV_STOP:
-		mutex_lock(&gov_lock);
-		for_each_cpu(j, policy->cpus) {
-			pcpu = &per_cpu(cpuinfo, j);
-			down_write(&pcpu->enable_sem);
-			pcpu->governor_enabled = 0;
-			pcpu->target_freq = 0;
-			del_timer_sync(&pcpu->cpu_timer);
-			del_timer_sync(&pcpu->cpu_slack_timer);
-			up_write(&pcpu->enable_sem);
-		}
-
-		if (--active_count > 0) {
-			if (!policy->cpu)
-				input_unregister_handler(&interactive_input_handler);
-			mutex_unlock(&gov_lock);
-			return 0;
-		}
-
-		cpufreq_unregister_notifier(
-			&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
-		idle_notifier_unregister(&cpufreq_interactive_idle_nb);
-		sysfs_remove_group(cpufreq_global_kobject,
-				&interactive_attr_group);
-		mutex_unlock(&gov_lock);
-
-		break;
-
-	case CPUFREQ_GOV_LIMITS:
-		if (policy->max < policy->cur)
-			__cpufreq_driver_target(policy,
-					policy->max, CPUFREQ_RELATION_H);
-		else if (policy->min > policy->cur)
-			__cpufreq_driver_target(policy,
-					policy->min, CPUFREQ_RELATION_L);
-		for_each_cpu(j, policy->cpus) {
-			pcpu = &per_cpu(cpuinfo, j);
-
-			/* hold write semaphore to avoid race */
-			down_write(&pcpu->enable_sem);
-			if (pcpu->governor_enabled == 0) {
-				up_write(&pcpu->enable_sem);
-				continue;
-			}
-
-			/* update target_freq firstly */
-			if (policy->max < pcpu->target_freq)
-				pcpu->target_freq = policy->max;
-			else if (policy->min > pcpu->target_freq)
-				pcpu->target_freq = policy->min;
-
-			/* Reschedule timer.
-			 * Delete the timers, else the timer callback may
-			 * return without re-arm the timer when failed
-			 * acquire the semaphore. This race may cause timer
-			 * stopped unexpectedly.
-			 */
-			del_timer_sync(&pcpu->cpu_timer);
-			del_timer_sync(&pcpu->cpu_slack_timer);
-			cpufreq_interactive_timer_start(j);
-			up_write(&pcpu->enable_sem);
-		}
-		break;
+	for_each_cpu(j, policy->cpus) {
+		pcpu = &per_cpu(cpuinfo, j);
+		pcpu->policy = policy;
+		pcpu->target_freq = policy->cur;
+		pcpu->freq_table = freq_table;
+		pcpu->floor_freq = pcpu->target_freq;
+		pcpu->floor_validate_time =
+			ktime_to_us(ktime_get());
+		pcpu->hispeed_validate_time =
+			pcpu->floor_validate_time;
+		down_write(&pcpu->enable_sem);
+		del_timer_sync(&pcpu->cpu_timer);
+		del_timer_sync(&pcpu->cpu_slack_timer);
+		cpufreq_interactive_timer_start(j);
+		pcpu->governor_enabled = 1;
+		up_write(&pcpu->enable_sem);
 	}
+
+	/*
+	 * Do not register the idle hook and create sysfs
+	 * entries if we have already done so.
+	 */
+	if (++active_count > 1) {
+		mutex_unlock(&gov_lock);
+		return 0;
+	}
+
+	rc = sysfs_create_group(cpufreq_global_kobject,
+			&interactive_attr_group);
+	if (rc) {
+		mutex_unlock(&gov_lock);
+		return rc;
+	}
+
+	idle_notifier_register(&cpufreq_interactive_idle_nb);
+	cpufreq_register_notifier(
+		&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
+	mutex_unlock(&gov_lock);
 	return 0;
+}
+
+static void intelliactive_gov_stop(struct cpufreq_policy *policy)
+{
+	unsigned int j;
+	struct cpufreq_interactive_cpuinfo *pcpu;
+
+	mutex_lock(&gov_lock);
+	for_each_cpu(j, policy->cpus) {
+		pcpu = &per_cpu(cpuinfo, j);
+		down_write(&pcpu->enable_sem);
+		pcpu->governor_enabled = 0;
+		pcpu->target_freq = 0;
+		del_timer_sync(&pcpu->cpu_timer);
+		del_timer_sync(&pcpu->cpu_slack_timer);
+		up_write(&pcpu->enable_sem);
+	}
+
+	if (--active_count > 0) {
+		if (!policy->cpu)
+			input_unregister_handler(&interactive_input_handler);
+		mutex_unlock(&gov_lock);
+		return;
+	}
+
+	cpufreq_unregister_notifier(
+		&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
+	idle_notifier_unregister(&cpufreq_interactive_idle_nb);
+	sysfs_remove_group(cpufreq_global_kobject,
+			&interactive_attr_group);
+	mutex_unlock(&gov_lock);
+}
+
+static void intelliactive_gov_limits(struct cpufreq_policy *policy)
+{
+	unsigned int j;
+	struct cpufreq_interactive_cpuinfo *pcpu;
+
+	if (policy->max < policy->cur)
+		__cpufreq_driver_target(policy,
+				policy->max, CPUFREQ_RELATION_H);
+	else if (policy->min > policy->cur)
+		__cpufreq_driver_target(policy,
+				policy->min, CPUFREQ_RELATION_L);
+	for_each_cpu(j, policy->cpus) {
+		pcpu = &per_cpu(cpuinfo, j);
+
+		/* hold write semaphore to avoid race */
+		down_write(&pcpu->enable_sem);
+		if (pcpu->governor_enabled == 0) {
+			up_write(&pcpu->enable_sem);
+			continue;
+		}
+
+		/* update target_freq firstly */
+		if (policy->max < pcpu->target_freq)
+			pcpu->target_freq = policy->max;
+		else if (policy->min > pcpu->target_freq)
+			pcpu->target_freq = policy->min;
+
+		/* Reschedule timer.
+		 * Delete the timers, else the timer callback may
+		 * return without re-arm the timer when failed
+		 * acquire the semaphore. This race may cause timer
+		 * stopped unexpectedly.
+		 */
+		del_timer_sync(&pcpu->cpu_timer);
+		del_timer_sync(&pcpu->cpu_slack_timer);
+		cpufreq_interactive_timer_start(j);
+		up_write(&pcpu->enable_sem);
+	}
 }
 
 static void cpufreq_interactive_nop_timer(unsigned long data)
 {
 }
+
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_INTELLIACTIVE
+struct cpufreq_governor *cpufreq_default_governor(void)
+{
+	return &cpufreq_gov_intelliactive;
+}
+#endif
 
 static int __init cpufreq_intelliactive_init(void)
 {
